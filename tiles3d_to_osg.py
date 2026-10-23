@@ -661,11 +661,21 @@ class Converter:
             if image_bytes is None:
                 image_paths.append(None)
                 continue
-            if ext and ext.lower() in (".jpg", ".jpeg"):
-                image_bytes = mirror_jpeg_vertically(image_bytes)
             texture_dir.mkdir(parents=True, exist_ok=True)
             image_path = texture_dir / f"{rel.stem}_{image_index}{ext or '.bin'}"
-            image_path.write_bytes(image_bytes)
+            is_jpeg = bool(ext and ext.lower() in (".jpg", ".jpeg"))
+            if is_jpeg:
+                marker_path = image_path.with_name(image_path.name + ".mirrored.sha256")
+                source_hash = hashlib.sha256(image_bytes).hexdigest()
+                try:
+                    current_marker = marker_path.read_text(encoding="ascii").strip()
+                except OSError:
+                    current_marker = ""
+                if not image_path.is_file() or image_path.stat().st_size == 0 or current_marker != source_hash:
+                    image_path.write_bytes(mirror_jpeg_vertically(image_bytes))
+                    marker_path.write_text(source_hash + "\n", encoding="ascii")
+            elif not image_path.is_file() or image_path.stat().st_size == 0:
+                image_path.write_bytes(image_bytes)
             image_paths.append(image_path)
 
         def image_for_material(material_index: int | None) -> tuple[Path | None, dict[str, Any]]:
