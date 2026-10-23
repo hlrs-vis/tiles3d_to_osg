@@ -8,7 +8,8 @@ Usage:
 The downloaded directory mirrors the server URL path layout. Converted GLB
 geometry and tileset hierarchy pages are written below output/osg/ using the
 same relative layout. Each PagedLOD loads its converted OSG geometry pages.
-No third-party packages are required.
+Pillow is required to vertically mirror JPEG textures; install it with
+`python -m pip install Pillow`.
 """
 
 from __future__ import annotations
@@ -16,6 +17,7 @@ from __future__ import annotations
 import argparse
 import base64
 import hashlib
+import io
 import json
 import math
 import os
@@ -108,6 +110,19 @@ def fmt(value: float) -> str:
 
 def osg_escape(value: str) -> str:
     return value.replace("\\", "\\\\").replace('"', '\\"')
+
+
+def mirror_jpeg_vertically(data: bytes) -> bytes:
+    """Vertically mirror a JPEG image and return the resulting JPEG bytes."""
+    try:
+        from PIL import Image, ImageOps
+    except ImportError as exc:
+        raise RuntimeError("Mirroring JPEG textures requires Pillow; install it with 'python -m pip install Pillow'") from exc
+    with Image.open(io.BytesIO(data)) as image:
+        mirrored = ImageOps.flip(image)
+        output = io.BytesIO()
+        mirrored.save(output, format="JPEG", quality=100, subsampling=0)
+        return output.getvalue()
 
 
 IDENTITY = [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1]
@@ -646,10 +661,11 @@ class Converter:
             if image_bytes is None:
                 image_paths.append(None)
                 continue
+            if ext and ext.lower() in (".jpg", ".jpeg"):
+                image_bytes = mirror_jpeg_vertically(image_bytes)
             texture_dir.mkdir(parents=True, exist_ok=True)
             image_path = texture_dir / f"{rel.stem}_{image_index}{ext or '.bin'}"
-            if not image_path.is_file() or image_path.stat().st_size == 0:
-                image_path.write_bytes(image_bytes)
+            image_path.write_bytes(image_bytes)
             image_paths.append(image_path)
 
         def image_for_material(material_index: int | None) -> tuple[Path | None, dict[str, Any]]:
@@ -894,7 +910,7 @@ class Converter:
                         result["contents"].append(osg_path)
                         if result["page_hint"] is None:
                             result["page_hint"] = osg_path
-                    except (ValueError, OSError, KeyError, IndexError, struct.error) as exc:
+                    except (ValueError, OSError, KeyError, IndexError, RuntimeError, struct.error) as exc:
                         print(f"ERROR converting GLB {glb_path}: {exc}", file=sys.stderr)
                         self.errors += 1
         for child in tile.get("children", []):
