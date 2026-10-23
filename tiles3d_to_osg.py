@@ -658,6 +658,7 @@ class Converter:
 
         lines: list[str] = []
         def emit_primitive(mesh_name: str, primitive_index: int, primitive: dict[str, Any], node_matrix: list[float]) -> None:
+            nonlocal lines
             attributes = primitive.get("attributes", {})
             position_index = attributes.get("POSITION")
             if position_index is None:
