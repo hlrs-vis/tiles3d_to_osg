@@ -468,9 +468,8 @@ class Converter:
                 return None
         return data, path
 
-    def write_json_page(self, path: Path, json_roots: list[dict[str, Any]],
-                        source_dir: Path, written: set[Path]) -> None:
-        """Write one directory page with sibling PagedLODs for its tiles."""
+    def write_tile_page(self, path: Path, tile: dict[str, Any], child_pages: list[Path]) -> None:
+        """Write one tile page: its geometry is inline and its direct refinements are paged."""
         def inline_osg(osg_file: Path, indent: str) -> list[str]:
             source_lines = osg_file.read_text(encoding="utf-8").splitlines()
             if len(source_lines) < 2:
@@ -487,123 +486,70 @@ class Converter:
                 return match.group(1) + osg_escape(target_texture) + match.group(3)
             return [indent + adjust_texture(line) for line in body]
 
-        def emit_external_page(tile: dict[str, Any], page_path: Path, indent: str) -> list[str]:
-            center, radius = tile["center"], tile["radius"]
-            rel = os.path.relpath(page_path, path.parent).replace("\\", "/")
-            return [indent + "PagedLOD {", indent + "  nodeMask 0xffffffff", indent + "  cullingActive TRUE",
-                    indent + "  Center " + " ".join(fmt(v) for v in center), indent + f"  Radius {fmt(radius)}",
-                    indent + "  RangeMode DISTANCE_FROM_EYE_POINT", indent + "  RangeList 1 {",
-                    indent + "    0 3.40282e38", indent + "  }", indent + "  DatabasePath .",
-                    indent + "  NumChildrenThatCannotBeExpired 0", indent + "  DisableExternalChildrenPaging 0",
-                    indent + "  FileNameList 1 {", indent + "    " + osg_escape(rel), indent + "  }",
-                    indent + "  num_children 0", indent + "}"]
-
-        def count_direct_nodes(lines: list[str], indent: str) -> int:
-            starts = {indent + "PagedLOD {", indent + "Group {", indent + "MatrixTransform {"}
-            return sum(1 for line in lines if line in starts)
-
-        def emit_tile(tile: dict[str, Any], indent: str) -> list[str]:
-            own_paths = [p for p in tile["contents"] if p.is_file() and p.stat().st_size > 0]
-            same_dir_children: list[dict[str, Any]] = []
-            external_pages: list[tuple[dict[str, Any], Path]] = []
-            for child in tile["children"]:
-                child_json = child.get("json_path")
-                if child_json is None or child_json.parent == source_dir:
-                    same_dir_children.append(child)
-                else:
-                    child_page = self.hierarchy_page_path(child_json)
-                    if child_page not in {item[1] for item in external_pages}:
-                        external_pages.append((child, child_page))
-
-            if not own_paths:
-                result: list[str] = []
-                for child in same_dir_children:
-                    result.extend(emit_tile(child, indent))
-                for child, child_page in external_pages:
-                    result.extend(emit_external_page(child, child_page, indent))
-                return result
-
-            center, radius, error = tile["center"], tile["radius"], tile["error"]
-            threshold = max(1.0, radius * 3.0)
-            has_refinement = bool(same_dir_children or external_pages)
-            ranges: list[tuple[float, float]] = [
-                (threshold, 3.40282e38) if has_refinement else (0.0, 3.40282e38)
-            ]
-            if same_dir_children:
-                ranges.append((0.0, threshold))
-            ranges.extend((0.0, threshold) for _ in external_pages)
-            inline_count = 1 + (1 if same_dir_children else 0)
-            filenames = [""] * inline_count
-            filenames.extend(os.path.relpath(child_page, path.parent).replace("\\", "/")
-                             for _child, child_page in external_pages)
-            out = [indent + "PagedLOD {", indent + "  nodeMask 0xffffffff", indent + "  cullingActive TRUE",
-                   indent + "  Center " + " ".join(fmt(v) for v in center), indent + f"  Radius {fmt(radius)}",
-                   indent + "  RangeMode DISTANCE_FROM_EYE_POINT", indent + f"  RangeList {len(ranges)} {{"]
-            out.extend(indent + f"    {fmt(near)} {fmt(far)}" for near, far in ranges)
-            out += [indent + "  }", indent + "  DatabasePath .", indent + "  NumChildrenThatCannotBeExpired 0",
-                    indent + "  DisableExternalChildrenPaging 0", indent + f"  FileNameList {len(filenames)} {{"]
-            out.extend(indent + "    " + osg_escape(filename) for filename in filenames)
-            out += [indent + "  }", indent + f"  num_children {inline_count}"]
+        own_paths = [p for p in tile["contents"] if p.is_file() and p.stat().st_size > 0]
+        center, radius, error = tile["center"], tile["radius"], tile["error"]
+        threshold = max(1.0, radius * 3.0)
+        ranges = ([(threshold, 3.40282e38)] if own_paths else []) + [
+            (0.0, threshold) for _ in child_pages]
+        filenames = ([""] if own_paths else []) + [
+            os.path.relpath(child_page, path.parent).replace("\\", "/") for child_page in child_pages]
+        out = ["PagedLOD {", "  nodeMask 0xffffffff", "  cullingActive TRUE",
+               "  Center " + " ".join(fmt(v) for v in center), f"  Radius {fmt(radius)}",
+               "  RangeMode DISTANCE_FROM_EYE_POINT", f"  RangeList {len(ranges)} {{"]
+        out.extend(f"    {fmt(near)} {fmt(far)}" for near, far in ranges)
+        out += ["  }", "  DatabasePath .", "  NumChildrenThatCannotBeExpired 0",
+                "  DisableExternalChildrenPaging 0", f"  FileNameList {len(filenames)} {{"]
+        out.extend("    " + ('""' if filename == "" else osg_escape(filename))
+                   for filename in filenames)
+        out += ["  }", f"  num_children {1 if own_paths else 0}"]
+        if own_paths:
             if len(own_paths) == 1:
-                out.extend(inline_osg(own_paths[0], indent + "  "))
+                out.extend(inline_osg(own_paths[0], "  "))
             else:
-                out += [indent + "  Group {", indent + "    nodeMask 0xffffffff",
-                        indent + f"    num_children {len(own_paths)}"]
+                out += ["  Group {", "    nodeMask 0xffffffff", f"    num_children {len(own_paths)}"]
                 for own_path in own_paths:
-                    out.extend(inline_osg(own_path, indent + "    "))
-                out.append(indent + "  }")
-            if same_dir_children:
-                child_indent = indent + "    "
-                child_lines: list[str] = []
-                for child in same_dir_children:
-                    child_lines.extend(emit_tile(child, child_indent))
-                out += [indent + "  Group {", indent + "    nodeMask 0xffffffff",
-                        indent + f"    num_children {count_direct_nodes(child_lines, child_indent)}"]
-                out.extend(child_lines)
-                out.append(indent + "  }")
-            out += [indent + "  Comment {", indent + f"    Geometric Error : {fmt(error)}",
-                    indent + "  }", indent + "}"]
-            return out
-
-        entries: list[str] = []
-        for json_root in json_roots:
-            entries.extend(emit_tile(json_root, "  "))
-        top_level_children = count_direct_nodes(entries, "  ")
-        lines = ["Group {", "  UniqueID Group_0", "  nodeMask 0xffffffff", "  cullingActive TRUE",
-                 f"  num_children {top_level_children}", *entries, "}", ""]
+                    out.extend(inline_osg(own_path, "    "))
+                out.append("  }")
+        out += ["  Comment {", f"    Geometric Error : {fmt(error)}", "  }", "}", ""]
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(chr(10).join(lines), encoding="utf-8")
-        written.add(path)
+        path.write_text(chr(10).join(out), encoding="utf-8")
         self.generated.add(path)
-        self.progress_done += 1
-        self.draw_progress("Writing directory pages", self.progress_done, self.progress_total, path)
 
     def write_json_pages(self, root: dict[str, Any]) -> Path:
-        roots_by_dir: dict[Path, list[dict[str, Any]]] = {}
+        def page_path(tile: dict[str, Any], path_hint: Path | None = None) -> Path:
+            if path_hint is None:
+                contents = [p for p in tile["contents"] if isinstance(p, Path)]
+                if contents:
+                    source = contents[0]
+                    rel = source.relative_to(self.output)
+                    path_hint = (self.output / "osg" / rel).with_name(rel.stem + "_tile.osg")
+                else:
+                    parent = tile.get("parent_page_path", self.output / "osg" / "root")
+                    path_hint = parent.with_name(parent.stem + f"_child_{tile.get('page_index', 0)}.osg")
+            return path_hint
 
-        def collect_pages(tile: dict[str, Any], source_dir: Path) -> None:
+        all_tiles: list[dict[str, Any]] = []
+        def collect(tile: dict[str, Any]) -> None:
+            all_tiles.append(tile)
             for child in tile["children"]:
-                child_json = child.get("json_path")
-                if child_json is None:
-                    collect_pages(child, source_dir)
-                    continue
-                child_dir = child_json.parent
-                if child_dir != source_dir:
-                    roots_by_dir.setdefault(child_dir, []).append(child)
-                collect_pages(child, child_dir)
-
-        root_dir = root["json_path"].parent
-        roots_by_dir[root_dir] = [root]
-        collect_pages(root, root_dir)
-        self.progress_total = max(1, len(roots_by_dir))
+                collect(child)
+        collect(root)
+        self.progress_total = max(1, len(all_tiles))
         self.progress_done = 0
-        written: set[Path] = set()
-        ordered_dirs = sorted(roots_by_dir, key=lambda d: len(d.parts), reverse=True)
-        for source_dir in ordered_dirs:
-            source_json = roots_by_dir[source_dir][0]["json_path"]
-            page_path = self.hierarchy_page_path(source_json)
-            self.write_json_page(page_path, roots_by_dir[source_dir], source_dir, written)
-        return self.hierarchy_page_path(root["json_path"])
+        def emit(tile: dict[str, Any], page: Path) -> Path:
+            child_pages: list[Path] = []
+            for index, child in enumerate(tile["children"]):
+                child["parent_page_path"] = page
+                child["page_index"] = index
+                child_page = page_path(child)
+                child_pages.append(emit(child, child_page))
+            self.write_tile_page(page, tile, child_pages)
+            self.progress_done += 1
+            self.draw_progress("Writing tile pages", self.progress_done, self.progress_total, page)
+            return page
+
+        root_path = self.output / "osg" / "root_tile.osg"
+        return emit(root, root_path)
 
     def write_tile_pages(self, root: dict[str, Any], root_path: Path) -> None:
         """Write one .osg file per tile/LOD directory, each with exactly one PagedLOD."""
