@@ -3,7 +3,7 @@
 """Download 3D Tiles, extract B3DM payloads, and write an OSG page for each JSON.
 
 Usage:
-  python tiles3d_to_osg.py URL [--output DIR]
+  python tiles3d_to_osg.py URL [--output DIR] [--min-lod L5]
 
 The downloaded directory mirrors the server URL path layout. Converted GLB
 geometry and tileset hierarchy pages are written below output/osg/ using the
@@ -299,11 +299,13 @@ def text_values(values: list[tuple[float, ...]], width: int = 6) -> list[str]:
 
 
 class Converter:
-    def __init__(self, output: Path, root_url: str, timeout: float, coordinate_frame: str):
+    def __init__(self, output: Path, root_url: str, timeout: float, coordinate_frame: str,
+                 min_lod: int | None = None):
         self.output = output
         self.root_url = root_url
         self.timeout = timeout
         self.coordinate_frame = coordinate_frame
+        self.min_lod = min_lod
         self.enu_transform: list[float] | None = None
         self.downloaded: set[str] = set()
         self.generated: set[Path] = set()
@@ -316,6 +318,13 @@ class Converter:
         self.scanned_tilesets = 0
         self.converted_glbs: dict[tuple[str, tuple[float, ...]], Path] = {}
         self.glb_transform_by_path: dict[Path, tuple[float, ...]] = {}
+
+    def within_lod_limit(self, url: str) -> bool:
+        """Include URL levels at or above the requested minimum (for example L5 includes L17..L5)."""
+        if self.min_lod is None:
+            return True
+        match = re.search(r"(?:^|/)L(\d+)(?:/|$)", urllib.parse.urlsplit(url).path, re.IGNORECASE)
+        return match is None or int(match.group(1)) >= self.min_lod
 
     def log(self, message: str) -> None:
         if self.progress_tty and self.progress_line_length:
@@ -393,6 +402,8 @@ class Converter:
                         if not uri:
                             continue
                         nested_url = urllib.parse.urljoin(tileset_url, uri)
+                        if not self.within_lod_limit(nested_url):
+                            continue
                         if urllib.parse.urlsplit(nested_url).path.lower().endswith(".json"):
                             count += self.count_tiles_in_tileset(nested_url, active)
                 for child in tile.get("children", []):
@@ -865,6 +876,8 @@ class Converter:
                 if not uri:
                     continue
                 content_url = urllib.parse.urljoin(tileset_url, uri)
+                if not self.within_lod_limit(content_url):
+                    continue
                 if urllib.parse.urlsplit(content_url).path.lower().endswith(".json"):
                     nested = self.read_tileset_node(content_url, world_transform)
                     if nested is not None:
@@ -895,17 +908,26 @@ class Converter:
         return result
 
 
+def parse_lod_level(value: str) -> int:
+    match = re.fullmatch(r"L?(\d+)", value.strip(), re.IGNORECASE)
+    if not match:
+        raise argparse.ArgumentTypeError("LOD must be a level such as L5 or 5")
+    return int(match.group(1))
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("url", help="URL of the root tileset.json")
     parser.add_argument("--output", "-o", type=Path, default=Path("tiles3d_download"), help="output directory")
     parser.add_argument("--timeout", type=float, default=60.0, help="HTTP timeout in seconds")
+    parser.add_argument("--min-lod", type=parse_lod_level, metavar="LEVEL",
+                        help="lowest LOD directory to process (for example L5 processes L17 through L5)")
     parser.add_argument("--coordinate-frame", choices=("ecef", "enu"), default="ecef",
                         help="OSG coordinates: geocentric ECEF (default) or local east/north/up")
     args = parser.parse_args()
     if not args.url.lower().split("?", 1)[0].endswith(".json"):
         parser.error("URL must point to a tileset JSON file")
-    converter = Converter(args.output.resolve(), args.url, args.timeout, "ecef")
+    converter = Converter(args.output.resolve(), args.url, args.timeout, "ecef", args.min_lod)
     result = converter.process_tileset(args.url, top=True)
     if result is None:
         print("No OSG output was generated.", file=sys.stderr)
