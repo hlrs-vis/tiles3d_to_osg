@@ -848,7 +848,9 @@ class Converter:
             print(f"ERROR invalid tileset JSON {tileset_url}: {exc}", file=sys.stderr)
             self.errors += 1
             return None
-        up_axis = str(tileset.get("asset", {}).get("gltfUpAxis", "Z")).upper()
+        # 3D Tiles 1.0 defaults embedded glTF content to Y-up. A tileset may
+        # explicitly declare Z or X; preserve that declaration per tileset.
+        up_axis = str(tileset.get("asset", {}).get("gltfUpAxis", "Y")).upper()
         if up_axis not in GLTF_UP_TO_Z_UP:
             print(f"WARNING unsupported gltfUpAxis {up_axis!r}; using Z", file=sys.stderr)
             up_axis = "Z"
@@ -912,6 +914,9 @@ class Converter:
                 extracted = self.content_file(content_url)
                 if extracted:
                     glb_path, rtc_center = extracted
+                    # 3D Tiles order: glTF node hierarchy (baked into vertices),
+                    # glTF-up to tileset Z-up, RTC_CENTER, then the accumulated
+                    # parent/child tile transforms into the global coordinates.
                     local_content_transform = multiply_matrices(
                         translation_matrix(rtc_center), GLTF_UP_TO_Z_UP[gltf_up_axis])
                     full_transform = multiply_matrices(world_transform, local_content_transform)
