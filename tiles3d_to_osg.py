@@ -7,7 +7,7 @@ Usage:
 
 The downloaded directory mirrors the server URL path layout. Converted GLB
 geometry and tileset hierarchy pages are written below output/osg/ using the
-same relative layout. Each PagedLOD loads its converted OSG geometry pages.
+same relative layout. Each PagedLOD loads its higher-detail tile pages.
 Pillow is required to vertically mirror JPEG textures; install it with
 `python -m pip install Pillow`.
 """
@@ -17,13 +17,17 @@ from __future__ import annotations
 import argparse
 import base64
 import hashlib
+import functools
 import io
 import json
 import math
 import os
 import re
+import shutil
 import struct
+import subprocess
 import sys
+import tempfile
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -190,6 +194,55 @@ def ecef_to_enu_matrix(origin: list[float]) -> list[float]:
     return matrix
 
 
+@functools.lru_cache(maxsize=1)
+def etrs89_dhhn2016_transformer():
+    """Get a PROJ operation from geocentric WGS84 to ETRS89/DHHN2016."""
+    try:
+        from pyproj.transformer import Transformer
+        import pyproj
+    except ImportError as exc:
+        raise RuntimeError("ETRS89/DHHN2016 requires pyproj/PROJ; install it with 'python -m pip install pyproj'") from exc
+    # Allow PROJ to download the DHHN2016 geoid grid when it is not installed locally.
+    pyproj.network.set_network_enabled(True)
+    try:
+        transformer = Transformer.from_crs(
+            "EPSG:4978",
+            "EPSG:25832+7837",
+            always_xy=True,
+            allow_ballpark=True,
+        )
+    except Exception as exc:
+        raise RuntimeError(f"PROJ could not set up EPSG:25832+7837 transformation: {exc}") from exc
+    return transformer
+
+
+def ecef_to_etrs89_dhhn2016(point: list[float]) -> list[float]:
+    try:
+        return list(etrs89_dhhn2016_transformer().transform(*point, errcheck=True))
+    except Exception as exc:
+        raise RuntimeError(f"PROJ failed to transform ECEF coordinates to EPSG:25832+7837: {exc}") from exc
+
+
+def ecef_to_etrs89_dhhn2016_matrix(origin: list[float]) -> list[float]:
+    """Build the local derivative of the PROJ ECEF-to-ETRS89/DHHN2016 operation."""
+    base = ecef_to_etrs89_dhhn2016(origin)
+    delta = 1.0
+    matrix = IDENTITY.copy()
+    for col in range(3):
+        sample = origin.copy()
+        sample[col] += delta
+        projected = ecef_to_etrs89_dhhn2016(sample)
+        for row in range(3):
+            matrix[col * 4 + row] = projected[row] - base[row]
+    for row in range(3):
+        matrix[12 + row] = base[row] - sum(matrix[col * 4 + row] * origin[col] for col in range(3))
+    return matrix
+
+
+def matrix_max_scale(matrix: list[float]) -> float:
+    return max(math.sqrt(sum(matrix[col * 4 + row] ** 2 for row in range(3))) for col in range(3))
+
+
 def tile_sphere(tile: dict[str, Any], parent_transform: list[float] | None = None
                 ) -> tuple[list[float], float, list[float], list[float], float]:
     """Return world sphere, composed transform, and local sphere for a tile."""
@@ -315,15 +368,17 @@ def text_values(values: list[tuple[float, ...]], width: int = 6) -> list[str]:
 
 class Converter:
     def __init__(self, output: Path, root_url: str, timeout: float, coordinate_frame: str,
-                 min_lod: int | None = None):
+                 min_lod: int | None = None, convert_ive: bool = False):
         self.output = output
         self.root_url = root_url
         self.timeout = timeout
         self.coordinate_frame = coordinate_frame
         self.min_lod = min_lod
+        self.convert_ive = convert_ive
         self.enu_transform: list[float] | None = None
         self.downloaded: set[str] = set()
         self.generated: set[Path] = set()
+        self.tile_pages: set[Path] = set()
         self.errors = 0
         self.page_counter = 0
         self.progress_total = 0
@@ -487,6 +542,22 @@ class Converter:
             return [indent + adjust_texture(line) for line in body]
 
         own_paths = [p for p in tile["contents"] if p.is_file() and p.stat().st_size > 0]
+        if own_paths and not child_pages:
+            # A leaf is the finest available detail: load its geometry directly
+            # instead of giving it a PagedLOD range that can expire at close range.
+            if len(own_paths) == 1:
+                lines = inline_osg(own_paths[0], "")
+            else:
+                lines = ["Group {", "  nodeMask 0xffffffff", f"  num_children {len(own_paths)}"]
+                for own_path in own_paths:
+                    lines.extend(inline_osg(own_path, "  "))
+                lines.append("}")
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(chr(10).join(lines + [""]), encoding="utf-8")
+            self.generated.add(path)
+            self.tile_pages.add(path)
+            return
+
         center, radius, error = tile["center"], tile["radius"], tile["error"]
         threshold = max(1.0, radius * 3.0)
         ranges = ([(threshold, 3.40282e38)] if own_paths else []) + [
@@ -514,6 +585,7 @@ class Converter:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(chr(10).join(out), encoding="utf-8")
         self.generated.add(path)
+        self.tile_pages.add(path)
 
     def write_json_pages(self, root: dict[str, Any]) -> Path:
         def page_path(tile: dict[str, Any], path_hint: Path | None = None) -> Path:
@@ -606,8 +678,25 @@ class Converter:
             rel_dir = Path()
         return self.output / "osg" / rel_dir / "lod.osg"
 
-    def convert_glb(self, glb_path: Path, world_transform: list[float]) -> Path:
-        transform_key = tuple(round(float(v), 9) for v in world_transform)
+    def convert_glb(self, glb_path: Path, world_transform: list[float],
+                    tile_center_ecef: list[float] | None = None) -> Path:
+        output_transform = world_transform
+        vertex_transform: list[float] | None = None
+        vertex_ecef_transform: list[float] | None = None
+        projected_center: list[float] | None = None
+        if self.coordinate_frame == "etrs89_dhhn2016":
+            if tile_center_ecef is None:
+                raise ValueError("UTM 32N conversion requires the ECEF center of the tile")
+            projected_center = ecef_to_etrs89_dhhn2016(tile_center_ecef)
+            projection = ecef_to_etrs89_dhhn2016_matrix(tile_center_ecef)
+            vertex_transform = multiply_matrices(projection, world_transform)
+            # Keep a local derivative for normals; positions use PROJ per vertex.
+            for axis in range(3):
+                vertex_transform[12 + axis] -= projected_center[axis]
+            vertex_ecef_transform = world_transform
+            output_transform = translation_matrix(projected_center)
+        transform_key = tuple(round(float(v), 9) for v in output_transform + (vertex_transform or [])
+                              + (vertex_ecef_transform or []) + (projected_center or []))
         cache_key = (str(glb_path.resolve()), transform_key)
         if cache_key in self.converted_glbs:
             return self.converted_glbs[cache_key]
@@ -616,12 +705,16 @@ class Converter:
         if existing_transform is not None and existing_transform != transform_key:
             suffix = hashlib.sha1(repr(transform_key).encode("ascii")).hexdigest()[:8]
             osg_path = osg_path.with_name(osg_path.stem + "_" + suffix + ".osg")
-        self.write_glb_osg(glb_path, osg_path, world_transform)
+        self.write_glb_osg(glb_path, osg_path, output_transform, vertex_transform,
+                           vertex_ecef_transform, projected_center)
         self.converted_glbs[cache_key] = osg_path
         self.glb_transform_by_path[osg_path] = transform_key
         return osg_path
 
-    def write_glb_osg(self, glb_path: Path, osg_path: Path, world_transform: list[float]) -> None:
+    def write_glb_osg(self, glb_path: Path, osg_path: Path, world_transform: list[float],
+                      vertex_transform: list[float] | None = None,
+                      vertex_ecef_transform: list[float] | None = None,
+                      projected_center: list[float] | None = None) -> None:
         data = glb_path.read_bytes()
         if len(data) < 20 or data[:4] != b"glTF":
             raise ValueError(f"Invalid GLB header: {glb_path}")
@@ -715,10 +808,22 @@ class Converter:
             position_index = attributes.get("POSITION")
             if position_index is None:
                 return
-            positions = [transform_point(node_matrix, p) for p in gltf_accessor(document, binary, position_index)]
+            positions = []
+            for point in gltf_accessor(document, binary, position_index):
+                local_point = transform_point(node_matrix, point)
+                if vertex_ecef_transform is not None and projected_center is not None:
+                    projected = ecef_to_etrs89_dhhn2016(
+                        transform_point(vertex_ecef_transform, local_point))
+                    positions.append(tuple(projected[i] - projected_center[i] for i in range(3)))
+                elif vertex_transform is not None:
+                    positions.append(transform_point(vertex_transform, local_point))
+                else:
+                    positions.append(local_point)
             normals = []
             if "NORMAL" in attributes:
-                normals = [transform_normal(node_matrix, n) for n in gltf_accessor(document, binary, attributes["NORMAL"])]
+                normals = [transform_normal(vertex_transform, transform_normal(node_matrix, n))
+                           if vertex_transform is not None else transform_normal(node_matrix, n)
+                           for n in gltf_accessor(document, binary, attributes["NORMAL"])]
             texcoords = gltf_accessor(document, binary, attributes["TEXCOORD_0"]) if "TEXCOORD_0" in attributes else []
             colors = gltf_accessor(document, binary, attributes["COLOR_0"]) if "COLOR_0" in attributes else []
             if colors and len(colors[0]) == 3:
@@ -889,13 +994,116 @@ class Converter:
             root_path.parent.mkdir(parents=True, exist_ok=True)
             root_path.write_text(root_page.read_text(encoding="utf-8"), encoding="utf-8")
             self.generated.add(root_path)
+            self.tile_pages.add(root_path)
         self.finish_progress()
+        if self.convert_ive:
+            ive_root_created = self.convert_pages_to_ive(root_path)
+            ive_root = root_path.with_suffix(".ive")
+            if ive_root_created:
+                return ive_root
         return root_path
+
+    def convert_pages_to_ive(self, root_path: Path) -> bool:
+        """Convert generated OSG files with osgconv and rewrite page references."""
+        osgconv = shutil.which("osgconv")
+        if osgconv is None:
+            raise RuntimeError("--ive requires osgconv to be installed and available on PATH")
+        pages = {page.resolve() for page in self.generated
+                 if page.suffix.lower() == ".osg" and page.is_file()}
+        pages.add(root_path.resolve())
+        osg_root = self.output / "osg"
+        if osg_root.is_dir():
+            pages.update(path.resolve() for path in osg_root.rglob("*.osg") if path.is_file())
+        ordered_pages: list[Path] = []
+        visited: set[Path] = set()
+        reference_pattern = re.compile(r'^\s*(?:"([^"]+\.osg)"|([^{}\s]+\.osg))\s*$', re.MULTILINE)
+
+        def page_references(text: str) -> list[str]:
+            return [match.group(1) or match.group(2)
+                    for match in reference_pattern.finditer(text)]
+
+        def visit_page(page: Path) -> None:
+            if page in visited:
+                return
+            visited.add(page)
+            try:
+                text = page.read_text(encoding="utf-8")
+            except (OSError, UnicodeError):
+                text = ""
+            for reference in page_references(text):
+                child = (page.parent / reference).resolve()
+                if child in pages:
+                    visit_page(child)
+            ordered_pages.append(page)
+
+        for page in pages:
+            visit_page(page)
+        self.log("Converting OSG hierarchy pages to IVE...")
+        self.progress_total = max(1, len(ordered_pages))
+        self.progress_done = 0
+        root_created = False
+        converted_pages: set[Path] = set()
+        for page in ordered_pages:
+            target = page.with_suffix(".ive")
+            temporary_path: Path | None = None
+            try:
+                text = page.read_text(encoding="utf-8")
+                def replace_reference(match: re.Match[str]) -> str:
+                    reference = match.group(1) or match.group(2)
+                    child = (page.parent / reference).resolve()
+                    if child not in converted_pages:
+                        return match.group(0)
+                    converted_reference = reference[:-4] + ".ive"
+                    if match.group(1) is not None:
+                        return f'"{converted_reference}"'
+                    return "    " + converted_reference
+                text = reference_pattern.sub(replace_reference, text)
+                with tempfile.NamedTemporaryFile(
+                    mode="w", encoding="utf-8", newline="\n", suffix=".osg",
+                    prefix=".ive_convert_", dir=page.parent, delete=False,
+                ) as temporary:
+                    temporary.write(text)
+                    temporary_path = Path(temporary.name)
+                result = subprocess.run([osgconv, "--compressed", str(temporary_path), str(target)],
+                                        capture_output=True, text=True, check=False)
+                if result.returncode != 0 or not target.is_file():
+                    detail = (result.stderr or result.stdout).strip()
+                    if not detail:
+                        detail = "osgconv returned success but did not write the output file"
+                    print(f"ERROR osgconv failed for {page}: {detail}", file=sys.stderr)
+                    self.errors += 1
+                else:
+                    converted_pages.add(page)
+                    self.generated.add(target)
+                    if page == root_path:
+                        root_created = True
+            except (OSError, UnicodeError) as exc:
+                print(f"ERROR converting {page} to IVE: {exc}", file=sys.stderr)
+                self.errors += 1
+            finally:
+                if temporary_path is not None:
+                    temporary_path.unlink(missing_ok=True)
+            self.progress_done += 1
+            self.draw_progress("Converting to IVE", self.progress_done, self.progress_total, target)
+        for page in converted_pages:
+            try:
+                page.unlink()
+                self.generated.discard(page)
+                self.tile_pages.discard(page)
+            except OSError as exc:
+                print(f"ERROR removing converted OSG file {page}: {exc}", file=sys.stderr)
+                self.errors += 1
+        return root_created
 
     def process_tile(self, tile: dict[str, Any], tileset_url: str,
                      parent_transform: list[float] | None = None,
                      gltf_up_axis: str = "Y") -> dict[str, Any] | None:
         center, radius, world_transform, _local_center, _local_radius = tile_sphere(tile, parent_transform)
+        tile_center_ecef = center.copy()
+        if self.coordinate_frame == "etrs89_dhhn2016":
+            projection = ecef_to_etrs89_dhhn2016_matrix(center)
+            center = ecef_to_etrs89_dhhn2016(center)
+            radius *= matrix_max_scale(projection)
         progress_url = tileset_url
         result: dict[str, Any] = {
             "center": center,
@@ -936,7 +1144,7 @@ class Converter:
                         translation_matrix(rtc_center), GLTF_UP_TO_Z_UP[gltf_up_axis])
                     full_transform = multiply_matrices(world_transform, local_content_transform)
                     try:
-                        osg_path = self.convert_glb(glb_path, full_transform)
+                        osg_path = self.convert_glb(glb_path, full_transform, tile_center_ecef)
                         result["contents"].append(osg_path)
                         if result["page_hint"] is None:
                             result["page_hint"] = osg_path
@@ -968,18 +1176,25 @@ def main() -> int:
     parser.add_argument("--timeout", type=float, default=60.0, help="HTTP timeout in seconds")
     parser.add_argument("--min-lod", type=parse_lod_level, metavar="LEVEL",
                         help="lowest LOD directory to process (for example L5 processes L17 through L5)")
-    parser.add_argument("--coordinate-frame", choices=("ecef", "enu"), default="ecef",
-                        help="OSG coordinates: geocentric ECEF (default) or local east/north/up")
+    parser.add_argument("--coordinate-frame", choices=("ecef", "etrs89_dhhn2016"), default="ecef",
+                        help="OSG coordinates: geocentric ECEF (default) or ETRS89 / UTM 32N + DHHN2016 (EPSG:25832+7837)")
+    parser.add_argument("--ive", action="store_true",
+                        help="also convert hierarchy pages to .ive with osgconv (must be on PATH)")
     args = parser.parse_args()
     if not args.url.lower().split("?", 1)[0].endswith(".json"):
         parser.error("URL must point to a tileset JSON file")
-    converter = Converter(args.output.resolve(), args.url, args.timeout, "ecef", args.min_lod)
-    result = converter.process_tileset(args.url, top=True)
+    converter = Converter(args.output.resolve(), args.url, args.timeout, args.coordinate_frame,
+                          args.min_lod, args.ive)
+    try:
+        result = converter.process_tileset(args.url, top=True)
+    except (RuntimeError, ValueError) as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
     if result is None:
         print("No OSG output was generated.", file=sys.stderr)
         return 1
     print(f"Root entry point: {result}")
-    root_lod = args.output.resolve() / "osg" / "root.osg"
+    root_lod = result
     if root_lod.is_file():
         print(f"Lowest-LOD startup page: {root_lod}")
     print(f"Downloaded {len(converter.downloaded)} files; generated {len(converter.generated)} OSG files; errors: {converter.errors}")
