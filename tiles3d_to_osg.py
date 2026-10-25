@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import concurrent.futures
 import hashlib
 import functools
 import io
@@ -28,6 +29,7 @@ import struct
 import subprocess
 import sys
 import tempfile
+import threading
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -368,13 +370,15 @@ def text_values(values: list[tuple[float, ...]], width: int = 6) -> list[str]:
 
 class Converter:
     def __init__(self, output: Path, root_url: str, timeout: float, coordinate_frame: str,
-                 min_lod: int | None = None, convert_ive: bool = False):
+                 min_lod: int | None = None, convert_ive: bool = False, threads: int = 1):
         self.output = output
         self.root_url = root_url
         self.timeout = timeout
         self.coordinate_frame = coordinate_frame
         self.min_lod = min_lod
         self.convert_ive = convert_ive
+        self.threads = max(1, threads)
+        self.worker_mode = False
         self.enu_transform: list[float] | None = None
         self.downloaded: set[str] = set()
         self.generated: set[Path] = set()
@@ -388,6 +392,12 @@ class Converter:
         self.scanned_tilesets = 0
         self.converted_glbs: dict[tuple[str, tuple[float, ...]], Path] = {}
         self.glb_transform_by_path: dict[Path, tuple[float, ...]] = {}
+        self.ive_conversion_complete = False
+        self._state_lock = threading.RLock()
+        self._url_locks = [threading.Lock() for _ in range(128)]
+        self._conversion_locks = [threading.Lock() for _ in range(128)]
+        self._output_lock = threading.Lock()
+        self._path_locks = [threading.Lock() for _ in range(128)]
 
     def within_lod_limit(self, url: str) -> bool:
         """Include URL levels at or above the requested minimum (for example L5 includes L17..L5)."""
@@ -397,10 +407,13 @@ class Converter:
         return match is None or int(match.group(1)) >= self.min_lod
 
     def log(self, message: str) -> None:
-        if self.progress_tty and self.progress_line_length:
-            sys.stdout.write("\r" + " " * self.progress_line_length + "\r")
-            self.progress_line_length = 0
-        print(message, flush=True)
+        if self.worker_mode:
+            return
+        with self._state_lock:
+            if self.progress_tty and self.progress_line_length:
+                sys.stdout.write("\r" + " " * self.progress_line_length + "\r")
+                self.progress_line_length = 0
+            print(message, flush=True)
 
     def _directory_label(self, value: str | Path) -> str:
         path = value if isinstance(value, Path) else self.local_path(value, "tileset.json")
@@ -411,28 +424,72 @@ class Converter:
         return label if label not in ("", ".") else "."
 
     def draw_progress(self, stage: str, done: int, total: int, directory: str | Path) -> None:
-        total = max(1, total)
-        done = min(done, total)
-        fraction = done / total
-        width = 24
-        filled = int(width * fraction)
-        bar = "#" * filled + "." * (width - filled)
-        label = self._directory_label(directory)
-        if len(label) > 48:
-            label = "..." + label[-45:]
-        line = f"{stage} [{bar}] {done}/{total} ({fraction:5.1%}) | {label}"
-        if self.progress_tty:
-            sys.stdout.write("\r" + line[:150].ljust(150))
-            self.progress_line_length = min(150, len(line))
-            sys.stdout.flush()
-        else:
-            print(line, flush=True)
+        with self._state_lock:
+            total = max(1, total)
+            done = min(done, total)
+            fraction = done / total
+            width = 24
+            filled = int(width * fraction)
+            bar = "#" * filled + "." * (width - filled)
+            label = self._directory_label(directory)
+            if len(label) > 48:
+                label = "..." + label[-45:]
+            line = f"{stage} [{bar}] {done}/{total} ({fraction:5.1%}) | {label}"
+            if self.progress_tty:
+                sys.stdout.write("\r" + line[:150].ljust(150))
+                self.progress_line_length = min(150, len(line))
+                sys.stdout.flush()
+            else:
+                print(line, flush=True)
+
+    def draw_check_progress(self, stage: str, done: int, directory: str | Path,
+                            force: bool = False) -> None:
+        if not force and done % 25:
+            return
+        with self._state_lock:
+            label = self._directory_label(directory)
+            line = f"{stage}: {done} checked | {label}"
+            if self.progress_tty:
+                sys.stdout.write("\r" + line[:150].ljust(150))
+                self.progress_line_length = min(150, len(line))
+                sys.stdout.flush()
+            else:
+                print(line, flush=True)
+            if force and self.progress_tty:
+                sys.stdout.write(chr(10))
+                sys.stdout.flush()
+                self.progress_line_length = 0
+
+    def cached_outputs_exist(self, files: Any, stage: str) -> bool:
+        if not isinstance(files, list) or not files:
+            return False
+        self.log(stage)
+        all_exist = True
+        for done, item in enumerate(files, 1):
+            if not isinstance(item, str):
+                all_exist = False
+            else:
+                output_path = (self.output / item).resolve()
+                if not output_path.is_relative_to(self.output.resolve()) or not output_path.is_file():
+                    all_exist = False
+            self.draw_check_progress(stage, done, self.output / item if isinstance(item, str) else self.output,
+                                     force=done == len(files))
+        return all_exist
 
     def finish_progress(self) -> None:
-        if self.progress_tty and self.progress_line_length:
-            sys.stdout.write(chr(10))
-            sys.stdout.flush()
-            self.progress_line_length = 0
+        with self._state_lock:
+            if self.progress_tty and self.progress_line_length:
+                sys.stdout.write(chr(10))
+                sys.stdout.flush()
+                self.progress_line_length = 0
+
+    def add_error(self) -> None:
+        with self._state_lock:
+            self.errors += 1
+
+    def path_lock(self, path: Path) -> threading.Lock:
+        key = path.resolve()
+        return self._path_locks[hash(key) % len(self._path_locks)]
 
     def draw_scan_status(self, tileset_url: str) -> None:
         self.scanned_tilesets += 1
@@ -493,8 +550,13 @@ class Converter:
         return self.output / safe_relative_path(url, self.root_url, fallback)
 
     def get(self, url: str, fallback: str) -> tuple[bytes, Path] | None:
-        path = self.local_path(url, fallback)
         key = urllib.parse.urldefrag(url)[0]
+        lock = self._url_locks[hash(key) % len(self._url_locks)]
+        with lock:
+            return self._get_locked(url, fallback, key)
+
+    def _get_locked(self, url: str, fallback: str, key: str) -> tuple[bytes, Path] | None:
+        path = self.local_path(url, fallback)
         # Reuse files from earlier runs as well as files fetched during this run.
         # A zero-byte file is not considered a successful download.
         if path.is_file() and path.stat().st_size > 0:
@@ -503,7 +565,7 @@ class Converter:
                 return path.read_bytes(), path
             except OSError as exc:
                 print(f"ERROR reading cached file {path}: {exc}", file=sys.stderr)
-                self.errors += 1
+                self.add_error()
                 return None
         if key not in self.downloaded:
             try:
@@ -514,7 +576,7 @@ class Converter:
                 self.log(f"Downloaded {url}")
             except (OSError, urllib.error.URLError, TimeoutError) as exc:
                 print(f"ERROR downloading {url}: {exc}", file=sys.stderr)
-                self.errors += 1
+                self.add_error()
                 return None
         else:
             try:
@@ -562,13 +624,25 @@ class Converter:
         threshold = max(1.0, radius * 3.0)
         ranges = ([(threshold, 3.40282e38)] if own_paths else []) + [
             (0.0, threshold) for _ in child_pages]
-        filenames = ([""] if own_paths else []) + [
-            os.path.relpath(child_page, path.parent).replace("\\", "/") for child_page in child_pages]
+        database_path = "."
+        child_filenames: list[str] = []
+        if child_pages:
+            # PagedLOD applies DatabasePath before opening each entry in
+            # FileNameList. Keep that field at the shared directory of the
+            # referenced pages, and store each page relative to that directory.
+            common_directory = Path(os.path.commonpath(
+                [str(child_page.parent.resolve()) for child_page in child_pages]))
+            osg_directory = (self.output / "osg").resolve()
+            database_path = os.path.relpath(common_directory, osg_directory).replace("\\", "/")
+            child_filenames = [
+                os.path.relpath(child_page, common_directory).replace("\\", "/")
+                for child_page in child_pages]
+        filenames = ([""] if own_paths else []) + child_filenames
         out = ["PagedLOD {", "  nodeMask 0xffffffff", "  cullingActive TRUE",
                "  Center " + " ".join(fmt(v) for v in center), f"  Radius {fmt(radius)}",
                "  RangeMode DISTANCE_FROM_EYE_POINT", f"  RangeList {len(ranges)} {{"]
         out.extend(f"    {fmt(near)} {fmt(far)}" for near, far in ranges)
-        out += ["  }", "  DatabasePath .", "  NumChildrenThatCannotBeExpired 0",
+        out += ["  }", f"  DatabasePath {osg_escape(database_path)}", "  NumChildrenThatCannotBeExpired 0",
                 "  DisableExternalChildrenPaging 0", f"  FileNameList {len(filenames)} {{"]
         out.extend("    " + ('""' if filename == "" else osg_escape(filename))
                    for filename in filenames)
@@ -698,18 +772,28 @@ class Converter:
         transform_key = tuple(round(float(v), 9) for v in output_transform + (vertex_transform or [])
                               + (vertex_ecef_transform or []) + (projected_center or []))
         cache_key = (str(glb_path.resolve()), transform_key)
-        if cache_key in self.converted_glbs:
-            return self.converted_glbs[cache_key]
-        osg_path = self.osg_path(glb_path)
-        existing_transform = self.glb_transform_by_path.get(osg_path)
-        if existing_transform is not None and existing_transform != transform_key:
-            suffix = hashlib.sha1(repr(transform_key).encode("ascii")).hexdigest()[:8]
-            osg_path = osg_path.with_name(osg_path.stem + "_" + suffix + ".osg")
-        self.write_glb_osg(glb_path, osg_path, output_transform, vertex_transform,
-                           vertex_ecef_transform, projected_center)
-        self.converted_glbs[cache_key] = osg_path
-        self.glb_transform_by_path[osg_path] = transform_key
-        return osg_path
+        lock = self._conversion_locks[hash(cache_key) % len(self._conversion_locks)]
+        with lock:
+            if cache_key in self.converted_glbs:
+                return self.converted_glbs[cache_key]
+            with self._output_lock:
+                osg_path = self.osg_path(glb_path)
+                existing_transform = self.glb_transform_by_path.get(osg_path)
+                if existing_transform is not None and existing_transform != transform_key:
+                    suffix = hashlib.sha1(repr(transform_key).encode("ascii")).hexdigest()[:8]
+                    osg_path = osg_path.with_name(osg_path.stem + "_" + suffix + ".osg")
+                self.glb_transform_by_path[osg_path] = transform_key
+            if osg_path.is_file() and osg_path.stat().st_size > 0:
+                with self._output_lock:
+                    self.converted_glbs[cache_key] = osg_path
+                    self.generated.add(osg_path)
+                return osg_path
+            self.write_glb_osg(glb_path, osg_path, output_transform, vertex_transform,
+                               vertex_ecef_transform, projected_center)
+            with self._output_lock:
+                self.converted_glbs[cache_key] = osg_path
+                self.generated.add(osg_path)
+            return osg_path
 
     def write_glb_osg(self, glb_path: Path, osg_path: Path, world_transform: list[float],
                       vertex_transform: list[float] | None = None,
@@ -772,18 +856,19 @@ class Converter:
             texture_dir.mkdir(parents=True, exist_ok=True)
             image_path = texture_dir / f"{rel.stem}_{image_index}{ext or '.bin'}"
             is_jpeg = bool(ext and ext.lower() in (".jpg", ".jpeg"))
-            if is_jpeg:
-                marker_path = image_path.with_name(image_path.name + ".mirrored.sha256")
-                source_hash = hashlib.sha256(image_bytes).hexdigest()
-                try:
-                    current_marker = marker_path.read_text(encoding="ascii").strip()
-                except OSError:
-                    current_marker = ""
-                if not image_path.is_file() or image_path.stat().st_size == 0 or current_marker != source_hash:
-                    image_path.write_bytes(mirror_jpeg_vertically(image_bytes))
-                    marker_path.write_text(source_hash + "\n", encoding="ascii")
-            elif not image_path.is_file() or image_path.stat().st_size == 0:
-                image_path.write_bytes(image_bytes)
+            with self.path_lock(image_path):
+                if is_jpeg:
+                    marker_path = image_path.with_name(image_path.name + ".mirrored.sha256")
+                    source_hash = hashlib.sha256(image_bytes).hexdigest()
+                    try:
+                        current_marker = marker_path.read_text(encoding="ascii").strip()
+                    except OSError:
+                        current_marker = ""
+                    if not image_path.is_file() or image_path.stat().st_size == 0 or current_marker != source_hash:
+                        image_path.write_bytes(mirror_jpeg_vertically(image_bytes))
+                        marker_path.write_text(source_hash + "\n", encoding="ascii")
+                elif not image_path.is_file() or image_path.stat().st_size == 0:
+                    image_path.write_bytes(image_bytes)
             image_paths.append(image_path)
 
         def image_for_material(material_index: int | None) -> tuple[Path | None, dict[str, Any]]:
@@ -924,13 +1009,17 @@ class Converter:
         output += ["}", ""]
         osg_path.parent.mkdir(parents=True, exist_ok=True)
         osg_path.write_text(chr(10).join(output), encoding="utf-8")
-        self.generated.add(osg_path)
 
     def content_file(self, content_url: str) -> tuple[Path, list[float]] | None:
         downloaded = self.get(content_url, "content.bin")
         if downloaded is None:
             return None
         data, original_path = downloaded
+        with self.path_lock(original_path.with_suffix(".glb")):
+            return self._decode_content_file(data, original_path, content_url)
+
+    def _decode_content_file(self, data: bytes, original_path: Path,
+                             content_url: str) -> tuple[Path, list[float]] | None:
         if data[:4] == b"b3dm":
             rtc_center = b3dm_rtc_center(data)
             glb_path = original_path.with_suffix(".glb")
@@ -939,7 +1028,7 @@ class Converter:
             extracted = decode_b3dm(data)
             if extracted is None:
                 print(f"ERROR invalid/unsupported B3DM: {content_url}", file=sys.stderr)
-                self.errors += 1
+                self.add_error()
                 return None
             glb, rtc_center = extracted
             glb_path.write_bytes(glb)
@@ -957,6 +1046,14 @@ class Converter:
         return None
 
     def read_tileset_node(self, tileset_url: str, parent_transform: list[float] | None = None) -> dict[str, Any] | None:
+        document = self.load_tileset_document(tileset_url)
+        if document is None:
+            return None
+        root, json_path, up_axis = document
+        return self.process_tile_tree(root, tileset_url, parent_transform, up_axis, json_path)
+
+    def load_tileset_document(self, tileset_url: str
+                              ) -> tuple[dict[str, Any], Path, str] | None:
         downloaded = self.get(tileset_url, "tileset.json")
         if downloaded is None:
             return None
@@ -966,7 +1063,7 @@ class Converter:
             root = tileset["root"]
         except (ValueError, KeyError, UnicodeDecodeError) as exc:
             print(f"ERROR invalid tileset JSON {tileset_url}: {exc}", file=sys.stderr)
-            self.errors += 1
+            self.add_error()
             return None
         # 3D Tiles 1.0 defaults embedded glTF content to Y-up. A tileset may
         # explicitly declare Z or X; preserve that declaration per tileset.
@@ -974,34 +1071,188 @@ class Converter:
         if up_axis not in GLTF_UP_TO_Z_UP:
             print(f"WARNING unsupported gltfUpAxis {up_axis!r}; using Z", file=sys.stderr)
             up_axis = "Z"
-        node = self.process_tile(root, tileset_url, parent_transform, up_axis)
-        if node is not None:
-            node["json_path"] = json_path
-        return node
+        return root, json_path, up_axis
+
+    def process_tile_tree(self, root_tile: dict[str, Any], tileset_url: str,
+                          parent_transform: list[float] | None, gltf_up_axis: str,
+                          json_path: Path) -> dict[str, Any] | None:
+        """Process the tile tree with a bounded worker pool and retain child order."""
+        root_node: dict[str, Any] | None = None
+        worker_initargs = (str(self.output), self.root_url, self.timeout,
+                           self.coordinate_frame, self.min_lod)
+        with concurrent.futures.ProcessPoolExecutor(
+                max_workers=self.threads, initializer=_initialize_tile_worker,
+                initargs=worker_initargs) as executor:
+            root_future = executor.submit(
+                _run_tile_worker,
+                (root_tile, tileset_url, parent_transform, gltf_up_axis, json_path))
+            pending: dict[concurrent.futures.Future, tuple[dict[str, Any] | None, int, str]] = {
+                root_future: (None, -1, tileset_url)
+            }
+            while pending:
+                completed, _ = concurrent.futures.wait(
+                    pending, return_when=concurrent.futures.FIRST_COMPLETED)
+                for future in completed:
+                    parent_node, child_index, task_url = pending.pop(future)
+                    try:
+                        node, child_specs, downloaded, generated, worker_errors = future.result()
+                        self.downloaded.update(downloaded)
+                        self.generated.update(generated)
+                        if worker_errors:
+                            with self._state_lock:
+                                self.errors += worker_errors
+                    except Exception as exc:
+                        print(f"ERROR processing tile at {task_url}: {exc}", file=sys.stderr)
+                        self.add_error()
+                        with self._state_lock:
+                            self.progress_done += 1
+                            done = self.progress_done
+                        self.draw_progress("Processing tiles", done, self.progress_total, task_url)
+                        continue
+                    with self._state_lock:
+                        self.progress_done += 1
+                        done = self.progress_done
+                    self.draw_progress("Processing tiles", done, self.progress_total, task_url)
+                    if node is None:
+                        continue
+                    node["children"] = [None] * len(child_specs)
+                    if parent_node is None:
+                        root_node = node
+                    else:
+                        parent_node["children"][child_index] = node
+                    for index, spec in enumerate(child_specs):
+                        child, child_url, child_transform, child_up_axis, child_json_path = spec
+                        child_future = executor.submit(
+                            _run_tile_worker,
+                            (child, child_url, child_transform, child_up_axis, child_json_path))
+                        pending[child_future] = (node, index, child_url)
+
+        def prune_empty(node: dict[str, Any] | None) -> dict[str, Any] | None:
+            if node is None:
+                return None
+            node["children"] = [child for child in
+                                (prune_empty(child) for child in node["children"])
+                                if child is not None]
+            return node if node["contents"] or node["children"] else None
+
+        return prune_empty(root_node)
 
     def process_tileset(self, tileset_url: str, top: bool = False,
                         parent_transform: list[float] | None = None) -> Path | None:
-        self.prepare_progress(tileset_url)
-        root = self.read_tileset_node(tileset_url, parent_transform)
-        self.finish_progress()
-        if root is None:
-            return None
-        self.progress_done = 0
-        self.log("Writing OSG pages...")
-        root_page = self.write_json_pages(root)
         root_path = self.output / "osg" / "root.osg"
-        if root_page != root_path:
-            root_path.parent.mkdir(parents=True, exist_ok=True)
-            root_path.write_text(root_page.read_text(encoding="utf-8"), encoding="utf-8")
-            self.generated.add(root_path)
-            self.tile_pages.add(root_path)
-        self.finish_progress()
+        ive_root = root_path.with_suffix(".ive")
+        state_path = self.output / "osg" / ".tiles3d_complete.json"
+        config_key = hashlib.sha256(json.dumps({
+            "url": tileset_url,
+            "coordinate_frame": self.coordinate_frame,
+            "min_lod": self.min_lod,
+        }, sort_keys=True).encode("utf-8")).hexdigest()
+        try:
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            state = {}
+        if not isinstance(state, dict):
+            state = {}
+        ive_cache_valid = False
+        if (self.convert_ive and state.get("config") == config_key
+                and state.get("stage") == "ive"):
+            ive_cache_valid = (self.cached_outputs_exist(
+                state.get("files"), "Checking cached IVE files") and ive_root.is_file())
+        if ive_cache_valid:
+            self.log("IVE hierarchy already complete; skipping tile processing and page writing.")
+            return ive_root
+
+        osg_state_valid = False
+        if state.get("config") == config_key and state.get("stage") == "osg":
+            osg_state_valid = self.cached_outputs_exist(
+                state.get("files"), "Checking cached OSG files")
+        osg_complete = self.osg_hierarchy_complete(root_path)
+        if osg_complete and (osg_state_valid or not state):
+            self.log("OSG hierarchy already complete; skipping tile processing and page writing.")
+            self.generated.update((self.output / "osg").rglob("*.osg"))
+            self.tile_pages.update(path for path in self.generated if path.suffix.lower() == ".osg")
+        else:
+            self.prepare_progress(tileset_url)
+            root = self.read_tileset_node(tileset_url, parent_transform)
+            self.finish_progress()
+            if root is None:
+                return None
+            self.progress_done = 0
+            self.log("Writing OSG pages...")
+            root_page = self.write_json_pages(root)
+            if root_page != root_path:
+                root_path.parent.mkdir(parents=True, exist_ok=True)
+                root_path.write_text(root_page.read_text(encoding="utf-8"), encoding="utf-8")
+                self.generated.add(root_path)
+                self.tile_pages.add(root_path)
+            self.finish_progress()
+        if self.osg_hierarchy_complete(root_path):
+            osg_files = sorted(path.relative_to(self.output).as_posix()
+                               for path in (self.output / "osg").rglob("*.osg")
+                               if path.is_file())
+            state_path.parent.mkdir(parents=True, exist_ok=True)
+            state_path.write_text(json.dumps({
+                "config": config_key, "stage": "osg", "files": osg_files,
+            }, indent=2), encoding="utf-8")
         if self.convert_ive:
             ive_root_created = self.convert_pages_to_ive(root_path)
-            ive_root = root_path.with_suffix(".ive")
-            if ive_root_created:
+            if ive_root_created and self.ive_conversion_complete:
+                ive_files = sorted(path.relative_to(self.output).as_posix()
+                                   for path in (self.output / "osg").rglob("*.ive")
+                                   if path.is_file())
+                state_path.parent.mkdir(parents=True, exist_ok=True)
+                state_path.write_text(json.dumps({
+                    "config": config_key, "stage": "ive", "files": ive_files,
+                }, indent=2), encoding="utf-8")
                 return ive_root
         return root_path
+
+    def osg_hierarchy_complete(self, root_path: Path) -> bool:
+        """Return true when the root OSG page and every referenced page exist."""
+        osg_root = self.output / "osg"
+        if not root_path.is_file():
+            self.log("Checking existing OSG hierarchy...")
+            self.draw_check_progress("Checking existing OSG hierarchy", 0, root_path, force=True)
+            return False
+        stage = "Checking existing OSG hierarchy"
+        self.log(stage + "...")
+        reference_pattern = re.compile(
+            r'^\s*(?:"([^"]+\.(?:osg|ive))"|([^{}\s]+\.(?:osg|ive)))\s*$',
+            re.MULTILINE | re.IGNORECASE)
+        visited: set[Path] = set()
+        pending = [root_path.resolve()]
+        complete = True
+        while pending:
+            page = pending.pop()
+            if page in visited:
+                continue
+            visited.add(page)
+            if not page.is_file():
+                complete = False
+                break
+            try:
+                text = page.read_text(encoding="utf-8")
+            except (OSError, UnicodeError):
+                complete = False
+                break
+            database_match = re.search(r'^\s*DatabasePath\s+(.+?)\s*$', text, re.MULTILINE)
+            database_path = database_match.group(1).strip().strip('"') if database_match else "."
+            directory = (osg_root / database_path).resolve()
+            for match in reference_pattern.finditer(text):
+                reference = match.group(1) or match.group(2)
+                child = (directory / reference).resolve()
+                if not child.is_file():
+                    complete = False
+                    break
+                if child.suffix.lower() == ".osg":
+                    pending.append(child)
+            self.draw_check_progress(stage, len(visited), page,
+                                     force=not complete or not pending)
+            if not complete:
+                break
+        if not visited:
+            self.draw_check_progress(stage, 0, root_path, force=True)
+        return complete
 
     def convert_pages_to_ive(self, root_path: Path) -> bool:
         """Convert generated OSG files with osgconv and rewrite page references."""
@@ -1014,44 +1265,30 @@ class Converter:
         osg_root = self.output / "osg"
         if osg_root.is_dir():
             pages.update(path.resolve() for path in osg_root.rglob("*.osg") if path.is_file())
-        ordered_pages: list[Path] = []
-        visited: set[Path] = set()
         reference_pattern = re.compile(r'^\s*(?:"([^"]+\.osg)"|([^{}\s]+\.osg))\s*$', re.MULTILINE)
 
-        def page_references(text: str) -> list[str]:
-            return [match.group(1) or match.group(2)
-                    for match in reference_pattern.finditer(text)]
+        def reference_directory(page: Path, text: str) -> Path:
+            match = re.search(r'^\s*DatabasePath\s+(.+?)\s*$', text, re.MULTILINE)
+            if match is None:
+                return page.parent
+            database_path = match.group(1).strip().strip('"')
+            return (osg_root / database_path).resolve()
 
-        def visit_page(page: Path) -> None:
-            if page in visited:
-                return
-            visited.add(page)
-            try:
-                text = page.read_text(encoding="utf-8")
-            except (OSError, UnicodeError):
-                text = ""
-            for reference in page_references(text):
-                child = (page.parent / reference).resolve()
-                if child in pages:
-                    visit_page(child)
-            ordered_pages.append(page)
-
-        for page in pages:
-            visit_page(page)
         self.log("Converting OSG hierarchy pages to IVE...")
-        self.progress_total = max(1, len(ordered_pages))
+        self.progress_total = max(1, len(pages))
         self.progress_done = 0
         root_created = False
         converted_pages: set[Path] = set()
-        for page in ordered_pages:
+        def convert_one(page: Path) -> tuple[Path, bool, str | None]:
             target = page.with_suffix(".ive")
             temporary_path: Path | None = None
             try:
                 text = page.read_text(encoding="utf-8")
+                database_directory = reference_directory(page, text)
                 def replace_reference(match: re.Match[str]) -> str:
                     reference = match.group(1) or match.group(2)
-                    child = (page.parent / reference).resolve()
-                    if child not in converted_pages:
+                    child = (database_directory / reference).resolve()
+                    if child not in pages:
                         return match.group(0)
                     converted_reference = reference[:-4] + ".ive"
                     if match.group(1) is not None:
@@ -1070,34 +1307,49 @@ class Converter:
                     detail = (result.stderr or result.stdout).strip()
                     if not detail:
                         detail = "osgconv returned success but did not write the output file"
-                    print(f"ERROR osgconv failed for {page}: {detail}", file=sys.stderr)
-                    self.errors += 1
-                else:
-                    converted_pages.add(page)
-                    self.generated.add(target)
-                    if page == root_path:
-                        root_created = True
+                    return page, False, detail
+                return page, True, None
             except (OSError, UnicodeError) as exc:
-                print(f"ERROR converting {page} to IVE: {exc}", file=sys.stderr)
-                self.errors += 1
+                return page, False, str(exc)
             finally:
                 if temporary_path is not None:
                     temporary_path.unlink(missing_ok=True)
-            self.progress_done += 1
-            self.draw_progress("Converting to IVE", self.progress_done, self.progress_total, target)
-        for page in converted_pages:
-            try:
-                page.unlink()
-                self.generated.discard(page)
-                self.tile_pages.discard(page)
-            except OSError as exc:
-                print(f"ERROR removing converted OSG file {page}: {exc}", file=sys.stderr)
-                self.errors += 1
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=self.threads) as executor:
+            futures = {executor.submit(convert_one, page): page for page in pages}
+            for future in concurrent.futures.as_completed(futures):
+                page, succeeded, detail = future.result()
+                if succeeded:
+                    converted_pages.add(page)
+                    target = page.with_suffix(".ive")
+                    self.generated.add(target)
+                    if page == root_path:
+                        root_created = True
+                else:
+                    print(f"ERROR osgconv failed for {page}: {detail}", file=sys.stderr)
+                    self.errors += 1
+                self.progress_done += 1
+                self.draw_progress("Converting to IVE", self.progress_done,
+                                   self.progress_total, page.with_suffix(".ive"))
+        self.ive_conversion_complete = (
+            len(converted_pages) == len(pages)
+            and all(page.with_suffix(".ive").is_file() for page in pages))
+        if self.ive_conversion_complete:
+            for page in converted_pages:
+                try:
+                    page.unlink()
+                    self.generated.discard(page)
+                    self.tile_pages.discard(page)
+                except OSError as exc:
+                    print(f"ERROR removing converted OSG file {page}: {exc}", file=sys.stderr)
+                    self.errors += 1
         return root_created
 
-    def process_tile(self, tile: dict[str, Any], tileset_url: str,
-                     parent_transform: list[float] | None = None,
-                     gltf_up_axis: str = "Y") -> dict[str, Any] | None:
+    def process_tile_shallow(self, tile: dict[str, Any], tileset_url: str,
+                             parent_transform: list[float] | None = None,
+                             gltf_up_axis: str = "Y",
+                             json_path: Path | None = None
+                             ) -> tuple[dict[str, Any] | None, list[tuple[Any, ...]]]:
         center, radius, world_transform, _local_center, _local_radius = tile_sphere(tile, parent_transform)
         tile_center_ecef = center.copy()
         if self.coordinate_frame == "etrs89_dhhn2016":
@@ -1113,6 +1365,9 @@ class Converter:
             "children": [],
             "page_hint": None,
         }
+        if json_path is not None:
+            result["json_path"] = json_path
+        child_specs: list[tuple[Any, ...]] = []
         content = tile.get("content") or tile.get("contents") or []
         if isinstance(content, dict):
             content = [content]
@@ -1120,7 +1375,8 @@ class Converter:
             first_uri = content[0].get("uri") or content[0].get("url")
             if first_uri:
                 progress_url = urllib.parse.urljoin(tileset_url, first_uri)
-        self.draw_progress("Processing tiles", self.progress_done, self.progress_total, progress_url)
+        if not self.worker_mode:
+            self.draw_progress("Processing tiles", self.progress_done, self.progress_total, progress_url)
         if isinstance(content, list):
             for item in content:
                 uri = item.get("uri") or item.get("url")
@@ -1130,9 +1386,11 @@ class Converter:
                 if not self.within_lod_limit(content_url):
                     continue
                 if urllib.parse.urlsplit(content_url).path.lower().endswith(".json"):
-                    nested = self.read_tileset_node(content_url, world_transform)
-                    if nested is not None:
-                        result["children"].append(nested)
+                    nested_document = self.load_tileset_document(content_url)
+                    if nested_document is not None:
+                        nested_root, nested_json_path, nested_up_axis = nested_document
+                        child_specs.append((nested_root, content_url, world_transform,
+                                            nested_up_axis, nested_json_path))
                     continue
                 extracted = self.content_file(content_url)
                 if extracted:
@@ -1150,16 +1408,43 @@ class Converter:
                             result["page_hint"] = osg_path
                     except (ValueError, OSError, KeyError, IndexError, RuntimeError, struct.error) as exc:
                         print(f"ERROR converting GLB {glb_path}: {exc}", file=sys.stderr)
-                        self.errors += 1
+                        self.add_error()
         for child in tile.get("children", []):
-            child_node = self.process_tile(child, tileset_url, world_transform, gltf_up_axis)
-            if child_node is not None:
-                result["children"].append(child_node)
-        self.progress_done += 1
-        self.draw_progress("Processing tiles", self.progress_done, self.progress_total, progress_url)
-        if not result["contents"] and not result["children"]:
-            return None
-        return result
+            child_specs.append((child, tileset_url, world_transform, gltf_up_axis, None))
+        with self._state_lock:
+            self.progress_done += 1
+            done = self.progress_done
+        if not self.worker_mode:
+            self.draw_progress("Processing tiles", done, self.progress_total, progress_url)
+        if not result["contents"] and not child_specs:
+            return None, child_specs
+        return result, child_specs
+
+
+_TILE_WORKER: Converter | None = None
+
+
+def _initialize_tile_worker(output: str, root_url: str, timeout: float,
+                            coordinate_frame: str, min_lod: int | None) -> None:
+    """Create one persistent converter in each process-pool worker."""
+    global _TILE_WORKER
+    _TILE_WORKER = Converter(Path(output), root_url, timeout, coordinate_frame, min_lod)
+    _TILE_WORKER.worker_mode = True
+
+
+def _run_tile_worker(task: tuple[Any, ...]) -> tuple[Any, ...]:
+    """Process one tile serially and return its child tasks for main scheduling."""
+    if _TILE_WORKER is None:
+        raise RuntimeError("tile worker was not initialized")
+    converter = _TILE_WORKER
+    previous_downloads = set(converter.downloaded)
+    previous_outputs = set(converter.generated)
+    previous_errors = converter.errors
+    node, children = converter.process_tile_shallow(*task)
+    return (node, children,
+            list(converter.downloaded - previous_downloads),
+            list(converter.generated - previous_outputs),
+            converter.errors - previous_errors)
 
 
 def parse_lod_level(value: str) -> int:
@@ -1174,6 +1459,8 @@ def main() -> int:
     parser.add_argument("url", help="URL of the root tileset.json")
     parser.add_argument("--output", "-o", type=Path, default=Path("tiles3d_download"), help="output directory")
     parser.add_argument("--timeout", type=float, default=60.0, help="HTTP timeout in seconds")
+    parser.add_argument("-n", "--threads", type=int, default=1,
+                        help="number of parallel tile workers (default: 1; each tile and its files are processed serially)")
     parser.add_argument("--min-lod", type=parse_lod_level, metavar="LEVEL",
                         help="lowest LOD directory to process (for example L5 processes L17 through L5)")
     parser.add_argument("--coordinate-frame", choices=("ecef", "etrs89_dhhn2016"), default="ecef",
@@ -1183,8 +1470,10 @@ def main() -> int:
     args = parser.parse_args()
     if not args.url.lower().split("?", 1)[0].endswith(".json"):
         parser.error("URL must point to a tileset JSON file")
+    if args.threads < 1:
+        parser.error("-n/--threads must be at least 1")
     converter = Converter(args.output.resolve(), args.url, args.timeout, args.coordinate_frame,
-                          args.min_lod, args.ive)
+                          args.min_lod, args.ive, args.threads)
     try:
         result = converter.process_tileset(args.url, top=True)
     except (RuntimeError, ValueError) as exc:
